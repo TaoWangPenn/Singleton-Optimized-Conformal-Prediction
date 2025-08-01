@@ -176,6 +176,10 @@ class MCriterionRandomized(MCriterionBase):
 class LengthOptimizationRandomized(LengthOptimizationBase):
     """Randomized length optimization conformal prediction method."""
     
+    def compute_conformity_score(self, p_hat: np.ndarray, target: int) -> float:
+        gamma = self._get_gamma_lo(p_hat)
+        return gamma[target]
+    
     def compute_prediction_set(self, p_hat: np.ndarray, threshold: float = None) -> np.ndarray:
         gamma = self._get_gamma_lo(p_hat)
         samples = np.random.random(len(gamma)) < gamma
