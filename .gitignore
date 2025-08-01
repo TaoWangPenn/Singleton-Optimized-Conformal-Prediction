@@ -1,10 +1,17 @@
+# Environment & Cache
 .venv/
-notebooks/
-conformal_classification/
-.DS_Store
 .conda/
-imagenet_pre/
 __pycache__/
-src/conformalizer_M_cri.py
-*.pkl
+
+# macOS
+.DS_Store
+
+# Data, Models & Notebooks
+notebooks/
+imagenet_pre/
 models/logits/
+*.pkl
+
+# Specific Files
+src/conformalizer_M_cri.py
+conformal_classification/
