@@ -6,3 +6,5 @@ conformal_classification/
 imagenet_pre/
 __pycache__/
 src/conformalizer_M_cri.py
+*.pkl
+models/logits/
