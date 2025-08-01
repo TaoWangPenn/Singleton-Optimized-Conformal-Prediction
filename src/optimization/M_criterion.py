@@ -1,17 +1,22 @@
 import time
 import numpy as np
 from tqdm import tqdm 
+from typing import Optional
 from scipy.optimize import brentq, minimize, LinearConstraint
+from scipy.special import logsumexp
 from collections import namedtuple
 
 
-# --- More Efficient Optimization Problem Class ---
+# ============================================================================
+# M-criterion Optimization Problem
+# ============================================================================
+
 class OptimizationProblem:
     """
     Encapsulates the optimization problem with efficient dimensionality reduction.
     Objective and gradient now operate ONLY on the effective dimension.
     """
-    def __init__(self, p: np.ndarray, alpha: float, threshold: float = 1e-5):
+    def __init__(self, p: np.ndarray, alpha: float, threshold: Optional[float] = None):
         if not np.isclose(np.sum(p), 1.0):
             raise ValueError("p vector must be normalized (sum to 1).")
         if not np.all(p >= 0):
@@ -31,22 +36,27 @@ class OptimizationProblem:
             self.p = self.p_full[:self.K]                      
             print(f"Dimensionality reduced from {self.K_full} to {self.K}")
 
+    def objective(self, gamma_effective: np.ndarray) -> float:
+        """
+        Use Log-Sum-Exp (LSE) to compute log(g).
+        """
+
+        gamma = np.clip(gamma_effective, 1e-15, 1 - 1e-15) 
+        log_1_minus_gamma = np.log1p(-gamma)
+        L0 = np.sum(log_1_minus_gamma)
+        L = np.zeros(self.K + 1)
+        L[0] = L0
+        L[1:] = L0 - log_1_minus_gamma + np.log(gamma)
+        return logsumexp(L)
         
     def g(self, gamma: np.ndarray) -> float:
         """Computes g(gamma) on an effective-sized gamma vector."""
-        gamma = np.clip(gamma, 1e-10, 1 - 1e-10)
-        log_prod_1_minus_gamma = np.sum(np.log(1 - gamma))
-        sum_gamma_over_1_minus_gamma = np.sum(gamma / (1 - gamma))
-        return np.exp(log_prod_1_minus_gamma) * (1 + sum_gamma_over_1_minus_gamma)
-
-    def objective(self, gamma_effective: np.ndarray) -> float:
-        """Computes log(g) efficiently on the effective-sized gamma."""
-        val_g = self.g(gamma_effective)
-        return np.log(val_g + 1e-100)
+        val = np.exp(self.objective(gamma))
+        return val
 
     def gradient(self, gamma_effective: np.ndarray) -> np.ndarray:
         """Computes gradient efficiently on the effective-sized gamma."""
-        gamma = np.clip(gamma_effective, 1e-10, 1 - 1e-10)
+        gamma = np.clip(gamma_effective, 1e-15, 1 - 1e-15)
         one_minus_gamma = 1 - gamma
         gamma_over_1_minus_gamma = gamma / one_minus_gamma
         S = np.sum(gamma_over_1_minus_gamma)
@@ -70,9 +80,10 @@ class OptimizationProblem:
         try:
             optimal_lambda = brentq(f, lambda_min, lambda_max, xtol=1e-12, rtol=1e-12)
             return np.clip(y_effective - optimal_lambda * p_effective, 0, 1)
-        except ValueError:
+        except (ValueError, RuntimeError):
             f_min, f_max = f(lambda_min), f(lambda_max)
-            return np.clip(y_effective - (lambda_min if abs(f_min) < abs(f_max) else lambda_max) * p_effective, 0, 1)
+            optimal_lambda = lambda_min if abs(f_min) < abs(f_max) else lambda_max
+            return np.clip(y_effective - optimal_lambda * p_effective, 0, 1)
 
     def get_initial_point(self, strategy: str = 'random') -> np.ndarray:
         """Generates an initial point of the effective dimension."""
@@ -82,7 +93,10 @@ class OptimizationProblem:
         return self.project(np.random.rand(self.K))
   
 
-# --- Solver Classes ---
+# ============================================================================
+# Solvers Class 
+# ============================================================================
+
 SolveResult = namedtuple('SolveResult', 
                          ['solution', 'value', 'success', 'message', 'history'])
 
@@ -140,7 +154,7 @@ class SLSQPSolver:
     """
     Wrapper for the Scipy SLSQP solver to provide a consistent interface.
     """
-    def __init__(self, problem: OptimizationProblem, max_iter: int = None, tol: float = 1e-9):
+    def __init__(self, problem: OptimizationProblem, max_iter: int = 1000, tol: float = 1e-9):
         self.problem = problem
         self.max_iter = max_iter
         self.tol = tol
@@ -149,6 +163,7 @@ class SLSQPSolver:
         gamma0 = gamma0 if gamma0 is not None else self.problem.get_initial_point()
         result = minimize(
             fun=lambda g: -self.problem.objective(g), x0=gamma0, method='SLSQP',
+            jac=lambda g: -self.problem.gradient(g),
             bounds=[(0, 1) for _ in range(self.problem.K)],
             constraints={'type': 'eq', 'fun': lambda g: np.sum(self.problem.p * g) - self.problem.target_sum},
             options={'maxiter': self.max_iter, 'ftol': self.tol, 'disp': verbose}
@@ -160,8 +175,10 @@ class SLSQPSolver:
         return SolveResult(solution_full, -result.fun if result.success else -np.inf, result.success, result.message, [])
 
 
+# ============================================================================
+# Untility Functions
+# ============================================================================
 
-# --- Multi-start Optimization ---
 def find_best_solution_with_multistart(problem: OptimizationProblem, solver, num_starts: int) -> SolveResult:
     """
     Performs multi-start optimization.
@@ -192,7 +209,6 @@ def find_best_solution_with_multistart(problem: OptimizationProblem, solver, num
     return best_result_overall
 
 
-# --- Utility Functions ---
 def get_cutoff_index(p: np.ndarray, threshold: float = 1e-5) -> int:
     """
     Finds the index k such that the tail sum (from k onwards) is negligible.
@@ -226,6 +242,7 @@ def print_results(title, result, time_taken):
     print(f"Total time taken: {time_taken:.4f} seconds")
     print("="*50)
 
+
 def generate_p_dirichlet(K: int, scale: float = 0.1, seed: int = None) -> np.ndarray:
     """
     Generate a Dirichlet-distributed random vector and return it sorted in descending order.
@@ -236,9 +253,10 @@ def generate_p_dirichlet(K: int, scale: float = 0.1, seed: int = None) -> np.nda
 
     return np.sort(p)[::-1]
 
+
 def conjecture_gamma(p, alpha):
     """
-    Conjectured gamma based on the given p and alpha.
+    Conjectured gamma based on the given p and alpha, assuming p is sorted in descending order.
     """
     K = len(p)
     prefix_sum = np.cumsum(p)
@@ -261,19 +279,26 @@ def conjecture_gamma(p, alpha):
 # --- Main Execution ---
 if __name__ == '__main__':
     K = 1000
-    p = generate_p_dirichlet(K, scale=0.005)
+    p = generate_p_dirichlet(K, scale=1.0, seed=42)
     alpha = 0.05
     threshold = 0.001
     print(f"p = {np.round(p, 4)}")
 
-    problem = OptimizationProblem(p, alpha, threshold=threshold)
-    num_starts = 5
+    problem = OptimizationProblem(p, alpha, threshold=None)
+    num_starts = 10
+
+    pga_solver = PGASolver(problem, tol=1e-9, max_iter=1000)
+    gamma0 = conjecture_gamma(p, alpha)
+    result = pga_solver.solve(gamma0, verbose=True)
+    print(f"Optimal gamma (PGA): {np.round(result.solution, 4)}")
+    print(f"Optimal log_g(gamma) = {result.value:.6f}")
+    print(f"Optimal g(gamma) = {np.exp(result.value):.6f}")
 
     # --- Solve with Projected Gradient Ascent (Multi-start) ---
-    #pga_solver = PGASolver(problem, tol=1e-9, max_iter=1000)
-    #start_time_pga = time.time()
-    #best_result_pga = find_best_solution_with_multistart(problem, pga_solver, num_starts=num_starts)
-    #end_time_pga = time.time()
+    pga_solver = PGASolver(problem, tol=1e-9, max_iter=1000)
+    start_time_pga = time.time()
+    best_result_pga = find_best_solution_with_multistart(problem, pga_solver, num_starts=num_starts)
+    end_time_pga = time.time()
 
     # --- Solve with SLSQP (Multi-start) ---
     slsqp_solver = SLSQPSolver(problem, tol=1e-9, max_iter=1000)
@@ -281,7 +306,7 @@ if __name__ == '__main__':
     best_result_slsqp = find_best_solution_with_multistart(problem, slsqp_solver, num_starts=num_starts)
     end_time_slsqp = time.time()
 
-    #print_results("Overall Best Result from PGA Multi-start", best_result_pga, end_time_pga - start_time_pga)
+    print_results("Overall Best Result from PGA Multi-start", best_result_pga, end_time_pga - start_time_pga)
     print_results("Overall Best Result from SLSQP Multi-start", best_result_slsqp, end_time_slsqp - start_time_slsqp)
 
 
@@ -292,5 +317,6 @@ if __name__ == '__main__':
     problem_full = OptimizationProblem(p, alpha, threshold=None)
     print(f"Conjectured gamma (non-zero part, {len(non_zero_gamma)} elements): {np.round(non_zero_gamma, 4)}")
     g_conjecture = problem_full.g(gamma_conjecture)
+    log_g_conjecture = problem_full.objective(gamma_conjecture)
     print(f"Conjectured g(gamma) = {g_conjecture:.6f}")
-    print(f"Conjectured log_g(gamma) = {np.log(g_conjecture):.6f}")
+    print(f"Conjectured log_g(gamma) = {log_g_conjecture:.6f}")

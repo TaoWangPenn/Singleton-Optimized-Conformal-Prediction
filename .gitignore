@@ -2,3 +2,7 @@
 notebooks/
 conformal_classification/
 .DS_Store
+.conda/
+imagenet_pre/
+__pycache__/
+src/conformalizer_M_cri.py
