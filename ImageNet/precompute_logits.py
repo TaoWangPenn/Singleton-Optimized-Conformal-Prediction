@@ -15,12 +15,11 @@ import os
 import sys
 from pathlib import Path
 
-# Add the project root to Python path
 project_root = Path(__file__).parent.parent
 sys.path.append(str(project_root))
 
-from models.data import precompute_logits, load_dataset
-from models.model import load_pretrained_model, get_available_models
+from ImageNet.data import precompute_logits, load_dataset
+from ImageNet.model import load_pretrained_model, get_available_models
 
 
 def main():
@@ -101,7 +100,8 @@ def main():
         data_loader = load_dataset(
             args.data_path, 
             batch_size=args.batch_size, 
-            num_workers=args.num_workers
+            num_workers=args.num_workers,
+            model_name=args.model
         )
         
         # Load the model

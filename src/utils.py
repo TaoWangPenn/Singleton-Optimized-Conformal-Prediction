@@ -30,6 +30,7 @@ def set_random_seeds(seed):
 # ============================================================================
 # Performance Monitoring
 # ============================================================================
+# Adapt from https://github.com/aangelopoulos/conformal_classification
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -60,7 +61,7 @@ class AverageMeter(object):
 # Model Validation and Metrics
 # ============================================================================
 
-def validate(val_loader, model_or_predictor, base_model=None, val_logits=None, print_bool=True):
+def validate(val_loader, model_or_predictor, base_model=None, val_logits=None, print_bool=True, return_size_list=False):
     """
     Universal validation function supporting multiple input types.
     
@@ -72,9 +73,11 @@ def validate(val_loader, model_or_predictor, base_model=None, val_logits=None, p
         base_model: Required when using ConformalPredictor without pre-computed logits
         val_logits: Pre-computed validation logits (TensorDataset) for ConformalPredictor
         print_bool: Whether to print progress
+        return_size_list: Whether to return list of individual prediction set sizes
     
     Returns:
-        Tuple: (top1_accuracy, top5_accuracy, coverage, avg_set_size, prob_size_gt1)
+        If return_size_list=False: Tuple: (top1_accuracy, top5_accuracy, coverage, avg_set_size, prob_size_gt1, prob_empty_set)
+        If return_size_list=True: Tuple: (top1_accuracy, top5_accuracy, coverage, avg_set_size, prob_size_gt1, prob_empty_set, size_list)
     """
     
     if hasattr(model_or_predictor, 'forward') and hasattr(model_or_predictor, 'conformal_predictor'):
@@ -131,6 +134,10 @@ def validate(val_loader, model_or_predictor, base_model=None, val_logits=None, p
         coverage = AverageMeter('Coverage')
         size = AverageMeter('Size')
         prob_gt1 = AverageMeter('Size>1 Prob') 
+        prob_empty = AverageMeter('Empty Prob')
+        
+        # Store individual prediction set sizes if requested
+        all_sizes = [] if return_size_list else None
         
         end = time.time()
         N = 0
@@ -138,27 +145,40 @@ def validate(val_loader, model_or_predictor, base_model=None, val_logits=None, p
         for i, (x, target) in enumerate(data_loader):
             logits, prediction_sets, target, batch_size = get_predictions(x, target)
             
-            prec1, prec5 = accuracy(logits, target, topk=(1, 5))
+            # Dynamically determine topk based on number of classes
+            num_classes = logits.size(1)
+            topk = (1, min(5, num_classes))
+            prec1, prec5 = accuracy(logits, target, topk=topk)
             cvg, sz = coverage_size(prediction_sets, target.cpu() if target.is_cuda else target)
             p_gt1 = size_gt1_prob(prediction_sets) 
+            p_empty = empty_set_prob(prediction_sets)
+
+            # Store individual sizes if requested
+            if return_size_list:
+                batch_sizes = [len(s) for s in prediction_sets]
+                all_sizes.extend(batch_sizes)
 
             top1.update(prec1.item() / 100.0, n=batch_size)
             top5.update(prec5.item() / 100.0, n=batch_size)
             coverage.update(cvg, n=batch_size)
             size.update(sz, n=batch_size)
             prob_gt1.update(p_gt1, n=batch_size) 
+            prob_empty.update(p_empty, n=batch_size)
 
             batch_time.update(time.time() - end)
             end = time.time()
             N += batch_size
             
             if print_bool:
-                print(f'\rN: {N} | Time: {batch_time.val:.3f} ({batch_time.avg:.3f}) | Cvg@1: {top1.val:.3f} ({top1.avg:.3f}) | Cvg@5: {top5.val:.3f} ({top5.avg:.3f}) | Cvg: {coverage.val:.3f} ({coverage.avg:.3f}) | Size: {size.val:.3f} ({size.avg:.3f}) | Size>1: {prob_gt1.val:.3f} ({prob_gt1.avg:.3f})', end='')
+                print(f'\rN: {N} | Time: {batch_time.val:.3f} ({batch_time.avg:.3f}) | Cvg@1: {top1.val:.3f} ({top1.avg:.3f}) | Cvg@5: {top5.val:.3f} ({top5.avg:.3f}) | Cvg: {coverage.val:.3f} ({coverage.avg:.3f}) | Size: {size.val:.3f} ({size.avg:.3f}) | Size>1: {prob_gt1.val:.3f} ({prob_gt1.avg:.3f}) | Empty: {prob_empty.val:.3f} ({prob_empty.avg:.3f})', end='')
     
     if print_bool:
         print('') 
 
-    return top1.avg, top5.avg, coverage.avg, size.avg, prob_gt1.avg
+    if return_size_list:
+        return top1.avg, top5.avg, coverage.avg, size.avg, prob_gt1.avg, prob_empty.avg, all_sizes
+    else:
+        return top1.avg, top5.avg, coverage.avg, size.avg, prob_gt1.avg, prob_empty.avg
 
 
 def validate_conformal_predictor(val_loader, base_model, conformal_predictor, print_bool=True):
@@ -188,6 +208,17 @@ def size_gt1_prob(S):
             count_gt1 += 1
             
     return count_gt1 / len(S)
+
+def empty_set_prob(S):
+    count_empty = 0
+    if len(S) == 0:
+        return 0
+    
+    for s_i in S:
+        if len(s_i) == 0:
+            count_empty += 1
+            
+    return count_empty / len(S)
 
 def accuracy(output, target, topk=(1,)):
     maxk = max(topk)
@@ -223,24 +254,26 @@ def get_logits_targets(model, loader):
             sample_output = model(sample_input)
             num_classes = sample_output.shape[1]
 
-    all_logits = torch.empty((num_samples, num_classes), dtype=torch.float32, device='cpu')
-    all_labels = torch.empty(num_samples, dtype=torch.int64, device='cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    all_logits = torch.empty((num_samples, num_classes), dtype=torch.float32, device=device)
+    all_labels = torch.empty(num_samples, dtype=torch.int64, device=device)
 
     print('Computing logits for model (only happens once).')
     current_pos = 0
     with torch.no_grad():
         for x, targets in tqdm(loader):
-            if torch.cuda.is_available():
-                x = x.cuda()
+            x = x.to(device)
+            targets = targets.to(device)
 
-            batch_logits = model(x).detach().cpu()
+            batch_logits = model(x).detach()
             batch_size = x.shape[0]
 
             all_logits[current_pos:current_pos+batch_size, :] = batch_logits
-            all_labels[current_pos:current_pos+batch_size] = targets.cpu()
+            all_labels[current_pos:current_pos+batch_size] = targets
             current_pos += batch_size
 
-    return torch.utils.data.TensorDataset(all_logits, all_labels)
+    return torch.utils.data.TensorDataset(all_logits.cpu(), all_labels.cpu())
 
 # ============================================================================
 # Temperature Scaling (Platt Scaling)
@@ -319,49 +352,56 @@ def load_logits(model_name: str, logits_dir: str = './logits_cache') -> tdata.Te
 
 def split_logits(
     logits_dataset: tdata.TensorDataset, 
+    num_tune: int = 5000,
     num_calib: Optional[int] = None,
     num_val: Optional[int] = None,
+    tune_ratio: float = 0.15,
     calib_ratio: float = 0.3
-) -> Tuple[tdata.TensorDataset, tdata.TensorDataset]:
+) -> Tuple[tdata.TensorDataset, tdata.TensorDataset, tdata.TensorDataset]:
     """
-    Split logits dataset into calibration and validation sets.
+    Split logits dataset into tuning, calibration and validation sets.
+    
+    Args:
+        logits_dataset: Dataset to split
+        num_tune: Number of samples for hyperparameter tuning
+        num_calib: Number of samples for calibration (optional)
+        num_val: Number of samples for validation (optional)
+        tune_ratio: Ratio for tuning set if num_tune not specified
+        calib_ratio: Ratio for calibration set if num_calib not specified
+        
+    Returns:
+        Tuple of (tune_dataset, calib_dataset, val_dataset)
     """
     total_size = len(logits_dataset)
+    tune_size = min(num_tune, total_size)
     
     if num_calib is not None:
-        calib_size = min(num_calib, total_size)
+        calib_size = min(num_calib, total_size - tune_size)
     else:
         calib_size = int(calib_ratio * total_size)
     
     if num_val is not None:
-        val_size = min(num_val, total_size - calib_size)
+        val_size = min(num_val, total_size - tune_size - calib_size)
     else:
-        val_size = total_size - calib_size
+        val_size = total_size - tune_size - calib_size
     
-    if calib_size + val_size > total_size:
-        if num_calib is not None and num_val is not None:
-            val_size = total_size - calib_size
-            if val_size <= 0:
-                raise ValueError(f"Not enough data: need {calib_size} calib + {num_val} val, but only have {total_size} total")
+    if tune_size + calib_size + val_size > total_size:
+        raise ValueError(f"Not enough data: need {tune_size} tune + {calib_size} calib + {val_size} val, but only have {total_size} total")
     
     indices = torch.randperm(total_size)
-    calib_indices = indices[:calib_size]
-    val_indices = indices[calib_size:calib_size + val_size]
+    tune_indices = indices[:tune_size]
+    calib_indices = indices[tune_size:tune_size + calib_size]
+    val_indices = indices[tune_size + calib_size:tune_size + calib_size + val_size]
     
     all_logits = logits_dataset.tensors[0]
     all_targets = logits_dataset.tensors[1]
     
-    calib_logits = all_logits[calib_indices]
-    calib_targets = all_targets[calib_indices]
+    tune_dataset = tdata.TensorDataset(all_logits[tune_indices], all_targets[tune_indices])
+    calib_dataset = tdata.TensorDataset(all_logits[calib_indices], all_targets[calib_indices])
+    val_dataset = tdata.TensorDataset(all_logits[val_indices], all_targets[val_indices])
     
-    val_logits = all_logits[val_indices]
-    val_targets = all_targets[val_indices]
-    
-    calib_dataset = tdata.TensorDataset(calib_logits, calib_targets)
-    val_dataset = tdata.TensorDataset(val_logits, val_targets)
-    
-    print(f"Split dataset: {len(calib_dataset)} calibration, {len(val_dataset)} validation (from {total_size} total)")
-    return calib_dataset, val_dataset
+    print(f"Split dataset: {len(tune_dataset)} tuning, {len(calib_dataset)} calibration, {len(val_dataset)} validation (from {total_size} total)")
+    return tune_dataset, calib_dataset, val_dataset
 
 
 def load_and_split_logits(
