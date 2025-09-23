@@ -1,6 +1,6 @@
-# Singleton-Optimized Conformal Classification
+# Singleton-Optimized Conformal Prediction
 
-This repository contains the implementation for Singleton-Optimized Conformal Classification.
+This repository contains the implementation for Singleton-Optimized Conformal Prediction.
 
 ## Data Pre-processing and Logit Pre-computation
 
