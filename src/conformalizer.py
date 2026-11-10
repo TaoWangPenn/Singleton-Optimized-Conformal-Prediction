@@ -11,7 +11,6 @@ from numba import jit
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Union
 
-from src.conformalizer_old import NumbaConvexHullMethod
 from .utils import get_logits_targets, platt_logits, platt_scale
 
 # ============================================================================
